@@ -1,271 +1,549 @@
 import http.server
-import socketserver
 import json
-import numpy as np
-from dataclasses import dataclass
+import socketserver
 import threading
+import time
+from dataclasses import dataclass
+from typing import Optional
 
-# --- 1. Core Mathematical Model (NumPy Optimized) ---
+import numpy as np
+from core import ClientState, update_X, update_alpha
+from scheduler import GradientScheduler
+
 
 @dataclass
-class ClientState:
-    """
-    Encapsulates all state for a single client.
-    """
-    eta: float
-    beta: float
-    hat_alpha: float = 0.5
-    X: float = 1.0
+class RunConfig:
+    # number of drafters is fixed to three due to GPU memory constraints
+    num_clients: int = 3
+    total_slots: int = 20
+    cloud_capacity: int = 20
+    eta: float = 0.1
+    beta: float = 0.1
+    initial_prompt: str = "The future of artificial intelligence depends on"
+    target_model_name: str = "Qwen/Qwen2.5-7B-Instruct"
+    draft_model_name: str = "Qwen/Qwen2.5-0.5B-Instruct"
 
-def mu_func(S: np.ndarray, alpha: np.ndarray) -> np.ndarray:
-    """
-    Calculates expected goodput using vectorized operations.
-    Formula: μ(S,α) = (1 - α^(S+1)) / (1 - α) [cite: 6]
-    """
-    # Use np.isclose for robust floating point comparison.
-    close_to_one = np.isclose(alpha, 1.0)
-    # Initialize result array
-    result = np.zeros_like(alpha, dtype=float)
-    
-    # Case 1: alpha is close to 1, use limit S + 1
-    result[close_to_one] = S[close_to_one] + 1.0
-    
-    # Case 2: alpha is not close to 1, use standard formula
-    not_close_to_one = ~close_to_one
-    result[not_close_to_one] = (1 - alpha[not_close_to_one]**(S[not_close_to_one] + 1)) / (1 - alpha[not_close_to_one])
-    
-    return result
+    # allow construction from a dict (e.g. JSON payload)
+    @classmethod
+    def from_dict(cls, data: dict) -> "RunConfig":
+        # only use known fields, ignore extras
+        kwargs = {}
+        for field in ("num_clients", "total_slots", "cloud_capacity", "eta", "beta", "initial_prompt", "target_model_name", "draft_model_name"):
+            if field in data:
+                kwargs[field] = data[field]
+        return cls(**kwargs)
 
-def calculate_weight(X: np.ndarray) -> np.ndarray:
-    """
-    Calculates gradient weight. wᵢ(t) = ∇Uᵢ(Xᵢ(t)) = 1/Xᵢ(t) [cite: 10]
-    """
-    return 1.0 / np.maximum(X, 1e-6)
 
-class GradientScheduler:
-    """
-    Implements the gradient-based scheduling algorithm.
-    """
-    def __init__(self, capacity: int):
-        self.capacity = capacity
+class RealRunService:
+    def __init__(self, config: Optional[RunConfig] = None):
+        self.config = config or RunConfig()
+        self._engine = None
+        self._load_lock = threading.Lock()
 
-    def allocate(self, clients: list[ClientState]) -> np.ndarray:
+    def _ensure_engine(self):
+        if self._engine is not None:
+            return self._engine
+        with self._load_lock:
+            if self._engine is None:
+                from engine import RealSpeculativeEngine
+
+                self._engine = RealSpeculativeEngine(
+                    self.config.target_model_name,
+                    self.config.draft_model_name,
+                )
+        return self._engine
+
+    def run(self, override_config: Optional[dict] = None):
+        """Execute one simulation run.
+
+        If ``override_config`` is provided (typically from an API request),
+        update the service configuration accordingly before running.
         """
-        Allocates verification budget using a vectorized greedy algorithm.
-        Objective: arg max_S Σ wᵢ * μ(Sᵢ, α̂ᵢ) [cite: 11]
-        """
-        num_clients = len(clients)
-        allocations = np.zeros(num_clients, dtype=int)
-        
-        weights = calculate_weight(np.array([c.X for c in clients]))
-        alphas = np.array([c.hat_alpha for c in clients])
+        if override_config is not None:
+            # merge user-supplied configuration
+            cfg = RunConfig.from_dict(override_config)
+            # enforce fixed drafter count
+            cfg.num_clients = 3
+            self.config = cfg
 
-        for _ in range(self.capacity):
-            current_mu = mu_func(allocations, alphas)
-            next_mu = mu_func(allocations + 1, alphas)
-            
-            # Gainᵢ = wᵢ * [μ(Sᵢ+1, α̂ᵢ) - μ(Sᵢ, α̂ᵢ)]
-            marginal_gains = weights * (next_mu - current_mu)
-            
-            if np.sum(marginal_gains) <= 0:
-                break 
-            
-            best_client_idx = np.argmax(marginal_gains)
-            allocations[best_client_idx] += 1
-            
-        return allocations
+        engine = self._ensure_engine()
+        cfg = self.config
 
-# --- 2. Backend Simulation Engine ---
+        scheduler = GradientScheduler(capacity=cfg.cloud_capacity)
+        clients = [ClientState(eta=cfg.eta, beta=cfg.beta) for _ in range(cfg.num_clients)]
 
-def simulate_best_of_k(draft_length: int, true_alpha: float, k: int) -> int:
-    """
-    Simulates the best-of-K edge generation process. [cite: 39]
-    """
-    if draft_length == 0:
-        return 0
-    # Generate K draft outcomes at once
-    draft_accepts = np.random.binomial(1, true_alpha, size=(k, draft_length))
-    # Find first rejection (index of first 0) for each draft
-    # Note: np.argmin works because it finds the first minimum (0)
-    accepted_lengths = np.argmin(draft_accepts, axis=1)
-    # If a row has no zeros, argmin returns 0. Correct this case.
-    all_accepted_mask = (draft_accepts.all(axis=1))
-    accepted_lengths[all_accepted_mask] = draft_length
-    
-    return np.max(accepted_lengths)
+        history_allocations = np.zeros((cfg.total_slots, cfg.num_clients))
+        history_goodputs = np.zeros((cfg.total_slots, cfg.num_clients))
+        slot_goodput_history = []
+        slot_latency_ms = []
 
-def run_simulation(num_slots=50):
-    """
-    Executes the full simulation and returns historical data.
-    """
-    NUM_CLIENTS = 5
-    CLOUD_CAPACITY = 20
-    NUM_DRAFTS_K = 3
-    ETA = 0.1
-    BETA = 0.1
-    
-    scheduler = GradientScheduler(capacity=CLOUD_CAPACITY)
-    clients = [ClientState(eta=ETA, beta=BETA) for _ in range(NUM_CLIENTS)]
-    true_alphas = np.random.uniform(0.1, 0.9, size=NUM_CLIENTS)
+        engine.set_prompt(cfg.initial_prompt)
+        initial_prompt_ids = engine.current_prompt_ids.clone()
 
-    total_goodput_history = []
-    allocations_history = []
+        total_accepted_tokens = 0
+        total_emitted_tokens = 0
+        speculative_start = time.perf_counter()
 
-    for _ in range(num_slots):
-        # 1. Scheduling [cite: 11, 12]
-        S_allocations = scheduler.allocate(clients)
-        allocations_history.append(S_allocations)
+        for t in range(cfg.total_slots):
+            slot_start = time.perf_counter()
+            S_allocations = scheduler.allocate(clients)
+            slot_total_goodput = 0
 
-        slot_total_goodput = 0
-        for i, client in enumerate(clients):
-            S_i = S_allocations[i]
-            
-            # 2. Simulation (Generation & Verification) [cite: 39, 50]
-            l_i = simulate_best_of_k(S_i, true_alphas[i], NUM_DRAFTS_K)
-            x_i = 1 + l_i  # [cite: 53]
-            
-            # 3. State Update [cite: 13]
-            tilda_alpha = l_i / S_i if S_i > 0 else 0.0
-            client.hat_alpha = (1 - client.eta) * client.hat_alpha + client.eta * tilda_alpha # [cite: 7]
-            client.X = (1 - client.beta) * client.X + client.beta * x_i # [cite: 8]
-            
-            slot_total_goodput += x_i
-        
-        total_goodput_history.append(slot_total_goodput)
+            for i in range(cfg.num_clients):
+                S_i = int(S_allocations[i])
+                l_i, new_tokens = engine.step(draft_length_S=S_i)
+                engine.update_prompt(new_tokens)
 
-    final_allocations = np.mean(allocations_history, axis=0)
-    
-    return {
-        "total_goodput_history": [int(x) for x in total_goodput_history],
-        "final_allocations": final_allocations.tolist(),
-        "client_labels": [f"Client {i} (α={true_alphas[i]:.2f})" for i in range(NUM_CLIENTS)],
-    }
+                x_i = 1 + l_i
+                tilda_alpha = l_i / S_i if S_i > 0 else 0.0
+                clients[i].hat_alpha = update_alpha(clients[i].hat_alpha, tilda_alpha, clients[i].eta)
+                clients[i].X = update_X(clients[i].X, x_i, clients[i].beta)
 
-# --- 3. Lightweight Web Server & 4. Frontend UI ---
+                history_allocations[t, i] = S_i
+                history_goodputs[t, i] = x_i
+                slot_total_goodput += x_i
+                total_accepted_tokens += int(l_i)
+                total_emitted_tokens += int(len(new_tokens))
+
+            slot_goodput_history.append(float(slot_total_goodput))
+            slot_latency_ms.append((time.perf_counter() - slot_start) * 1000.0)
+
+        speculative_time_s = time.perf_counter() - speculative_start
+        final_text = engine.decode()
+
+        # Baseline: target model greedy generation for the same emitted token count.
+        baseline_time_s = 0.0
+        if total_emitted_tokens > 0:
+            import torch
+
+            with torch.no_grad():
+                baseline_start = time.perf_counter()
+                _ = engine.target_model.generate(
+                    initial_prompt_ids,
+                    max_new_tokens=total_emitted_tokens,
+                    do_sample=False,
+                    use_cache=True,
+                    pad_token_id=engine.tokenizer.eos_token_id,
+                )
+                baseline_time_s = time.perf_counter() - baseline_start
+
+        speculative_toks_per_s = (
+            total_emitted_tokens / speculative_time_s if speculative_time_s > 0 else 0.0
+        )
+        baseline_toks_per_s = total_emitted_tokens / baseline_time_s if baseline_time_s > 0 else 0.0
+        speedup_ratio = (
+            speculative_toks_per_s / baseline_toks_per_s if baseline_toks_per_s > 0 else 0.0
+        )
+
+        avg_allocations = np.mean(history_allocations, axis=0)
+        avg_goodputs = np.mean(history_goodputs, axis=0)
+        fairness = [
+            float(avg_goodputs[i] / avg_allocations[i]) if avg_allocations[i] > 0 else 0.0
+            for i in range(cfg.num_clients)
+        ]
+
+        result = {
+            "slot_goodput_history": slot_goodput_history,
+            "slot_latency_ms": [float(v) for v in slot_latency_ms],
+            "avg_allocations": avg_allocations.tolist(),
+            "avg_goodputs": avg_goodputs.tolist(),
+            "fairness": fairness,
+            "client_labels": [f"Client {i}" for i in range(cfg.num_clients)],
+            "initial_prompt": cfg.initial_prompt,
+            "final_text": final_text,
+            "summary": {
+                "total_slots": cfg.total_slots,
+                "total_emitted_tokens": total_emitted_tokens,
+                "total_accepted_tokens": total_accepted_tokens,
+                "speculative_time_s": speculative_time_s,
+                "baseline_time_s": baseline_time_s,
+                "speculative_toks_per_s": speculative_toks_per_s,
+                "baseline_toks_per_s": baseline_toks_per_s,
+                "speedup_ratio": speedup_ratio,
+            },
+        }
+        # persist to local file for later inspection
+        try:
+            import os, datetime
+            directory = os.path.join(os.getcwd(), "run_results")
+            os.makedirs(directory, exist_ok=True)
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            fname = os.path.join(directory, f"result_{timestamp}.json")
+            with open(fname, "w", encoding="utf-8") as f:
+                json.dump(result, f, indent=2)
+        except Exception:  # keep run results even if saving fails
+            pass
+
+        return result
+
+
+SERVICE = RealRunService()
+
 
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Speculative Decoding Simulation</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Real Speculative Decoding Dashboard</title>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <style>
-        body { font-family: sans-serif; display: flex; flex-direction: column; align-items: center; background: #f0f2f5; margin: 0; }
-        .container { background: white; padding: 2rem; border-radius: 8px; box-shadow: 0 4px 12px rgba(0,0,0,0.1); margin-top: 2rem; width: 90%; max-width: 1200px; }
-        h1 { text-align: center; color: #333; }
-        button { display: block; margin: 1rem auto; padding: 0.75rem 1.5rem; font-size: 1rem; color: white; background-color: #007bff; border: none; border-radius: 5px; cursor: pointer; transition: background-color 0.3s; }
-        button:hover { background-color: #0056b3; }
-        .charts { display: flex; justify-content: space-around; flex-wrap: wrap; margin-top: 2rem; }
-        .chart-container { width: 48%; min-width: 300px; margin-bottom: 2rem; }
+        :root {
+            --bg-a: #f7f8f4;
+            --bg-b: #e5ece3;
+            --card: #ffffff;
+            --ink: #16201b;
+            --muted: #4f5d55;
+            --brand: #1b8f6a;
+            --brand-2: #14543f;
+            --accent: #e2f3ea;
+            --line: #d8e2db;
+        }
+        * { box-sizing: border-box; }
+        body {
+            margin: 0;
+            color: var(--ink);
+            font-family: "Avenir Next", "Segoe UI", sans-serif;
+            background: radial-gradient(circle at 15% 15%, #fefef9 0%, var(--bg-a) 45%, var(--bg-b) 100%);
+            min-height: 100vh;
+            padding: 24px;
+        }
+        .wrap {
+            max-width: 1200px;
+            margin: 0 auto;
+            background: rgba(255,255,255,0.7);
+            border: 1px solid var(--line);
+            backdrop-filter: blur(5px);
+            border-radius: 18px;
+            box-shadow: 0 18px 40px rgba(23, 52, 40, 0.08);
+            padding: 20px;
+        }
+        h1 {
+            margin: 0 0 6px 0;
+            font-size: 30px;
+            letter-spacing: 0.2px;
+        }
+        .sub {
+            margin: 0 0 18px 0;
+            color: var(--muted);
+        }
+        .controls {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            margin-bottom: 14px;
+        }
+        button {
+            border: 0;
+            border-radius: 10px;
+            background: linear-gradient(135deg, var(--brand), var(--brand-2));
+            color: white;
+            padding: 10px 16px;
+            font-size: 15px;
+            cursor: pointer;
+        }
+        button:disabled {
+            cursor: not-allowed;
+            opacity: 0.6;
+        }
+        #status {
+            color: var(--muted);
+            font-size: 14px;
+        }
+        .stats {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+            gap: 10px;
+            margin: 12px 0 20px;
+        }
+        .card {
+            background: var(--card);
+            border: 1px solid var(--line);
+            border-radius: 12px;
+            padding: 10px 12px;
+        }
+        .label {
+            color: var(--muted);
+            font-size: 12px;
+            margin-bottom: 2px;
+        }
+        .value {
+            font-size: 21px;
+            font-weight: 700;
+        }
+        .grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 14px;
+        }
+        .panel {
+            background: var(--card);
+            border: 1px solid var(--line);
+            border-radius: 12px;
+            padding: 10px;
+            min-height: 290px;
+        }
+        .panel h3 {
+            margin: 4px 0 12px;
+            font-size: 15px;
+        }
+        .text-panel {
+            margin-top: 14px;
+            background: var(--card);
+            border: 1px solid var(--line);
+            border-radius: 12px;
+            padding: 12px;
+        }
+        #finalText {
+            margin-top: 6px;
+            white-space: pre-wrap;
+            line-height: 1.5;
+            color: #26352c;
+        }
+        @media (max-width: 900px) {
+            .grid { grid-template-columns: 1fr; }
+        }
     </style>
 </head>
 <body>
-    <div class="container">
-        <h1>Edge Diffusion Speculative Decoding</h1>
-        <button id="run-sim-btn">Run Simulation</button>
-        <div class="charts">
-            <div class="chart-container">
+    <div class="wrap">
+        <h1>Real Speculative Decoding Dashboard</h1>
+        <p class="sub">Runs real model inference (Qwen 7B target + 0.5B draft), records runtime stats, and compares against target-only baseline.</p>
+
+        <div class="controls">
+            <!-- configuration inputs -->
+            <label>Clients: <input id="numClients" type="number" value="3" min="1" style="width:60px" disabled></label> <!-- fixed at 3 -->
+            <label>Slots: <input id="totalSlots" type="number" value="20" min="1" style="width:60px"></label>
+            <label>Capacity: <input id="cloudCapacity" type="number" value="20" min="1" style="width:60px"></label>
+            <label>η: <input id="eta" type="number" step="0.01" value="0.1" style="width:50px"></label>
+            <label>β: <input id="beta" type="number" step="0.01" value="0.1" style="width:50px"></label>
+            <label>Prompt: <input id="initialPrompt" type="text" value="The future of artificial intelligence depends on" style="width:300px"></label>
+            <button id="runBtn">Run Real Experiment</button>
+            <a id="saveBtn" href="#" style="display:none; margin-left:12px;">Download Results</a>
+            <span id="status">Idle</span>
+        </div>
+
+        <div class="stats" id="stats"></div>
+
+        <div class="grid">
+            <div class="panel">
+                <h3>Total Goodput Per Slot</h3>
                 <canvas id="goodputChart"></canvas>
             </div>
-            <div class="chart-container">
-                <canvas id="allocationChart"></canvas>
+            <div class="panel">
+                <h3>Slot Latency (ms)</h3>
+                <canvas id="latencyChart"></canvas>
             </div>
+            <div class="panel">
+                <h3>Average Allocation (S_i)</h3>
+                <canvas id="allocChart"></canvas>
+            </div>
+            <div class="panel">
+                <h3>Fairness (x/S)</h3>
+                <canvas id="fairnessChart"></canvas>
+            </div>
+        </div>
+
+        <div class="text-panel">
+            <div class="label">Final Generated Text</div>
+            <div id="finalText">No run yet.</div>
         </div>
     </div>
 
     <script>
         const goodputCtx = document.getElementById('goodputChart').getContext('2d');
-        const allocationCtx = document.getElementById('allocationChart').getContext('2d');
-        let goodputChart, allocationChart;
+        const latencyCtx = document.getElementById('latencyChart').getContext('2d');
+        const allocCtx = document.getElementById('allocChart').getContext('2d');
+        const fairnessCtx = document.getElementById('fairnessChart').getContext('2d');
+        const runBtn = document.getElementById('runBtn');
+        const saveBtn = document.getElementById('saveBtn');
+        const statusEl = document.getElementById('status');
+        const statsEl = document.getElementById('stats');
+        const finalTextEl = document.getElementById('finalText');
+        // config inputs
+        const numClientsInp = document.getElementById('numClients');
+        const totalSlotsInp = document.getElementById('totalSlots');
+        const cloudCapacityInp = document.getElementById('cloudCapacity');
+        const etaInp = document.getElementById('eta');
+        const betaInp = document.getElementById('beta');
+        const initialPromptInp = document.getElementById('initialPrompt');
 
-        function createCharts(labels) {
-            if (goodputChart) goodputChart.destroy();
-            goodputChart = new Chart(goodputCtx, {
+        let goodputChart;
+        let latencyChart;
+        let allocChart;
+        let fairnessChart;
+
+        function makeLineChart(ctx, label, color) {
+            return new Chart(ctx, {
                 type: 'line',
-                data: {
-                    labels: [],
-                    datasets: [{
-                        label: 'Total System Goodput per Slot',
-                        data: [],
-                        borderColor: 'rgb(75, 192, 192)',
-                        tension: 0.1,
-                        fill: false,
-                    }]
-                }
-            });
-
-            if (allocationChart) allocationChart.destroy();
-            allocationChart = new Chart(allocationCtx, {
-                type: 'bar',
-                data: {
-                    labels: labels,
-                    datasets: [{
-                        label: 'Average Resource Allocation (Sᵢ)',
-                        data: [],
-                        backgroundColor: 'rgba(153, 102, 255, 0.6)',
-                    }]
-                },
-                options: { indexAxis: 'y' }
+                data: { labels: [], datasets: [{ label, data: [], borderColor: color, tension: 0.2, fill: false }] },
+                options: { responsive: true, maintainAspectRatio: false }
             });
         }
-        
-        document.getElementById('run-sim-btn').addEventListener('click', () => {
-            const btn = document.getElementById('run-sim-btn');
-            btn.textContent = 'Running...';
-            btn.disabled = true;
 
-            fetch('/api/run')
-                .then(response => response.json())
-                .then(data => {
-                    createCharts(data.client_labels); // Re-create charts with new labels
+        function makeBarChart(ctx, label, color) {
+            return new Chart(ctx, {
+                type: 'bar',
+                data: { labels: [], datasets: [{ label, data: [], backgroundColor: color }] },
+                options: { responsive: true, maintainAspectRatio: false }
+            });
+        }
 
-                    goodputChart.data.labels = Array.from({length: data.total_goodput_history.length}, (_, i) => i + 1);
-                    goodputChart.data.datasets[0].data = data.total_goodput_history;
-                    goodputChart.update();
+        function initCharts() {
+            if (goodputChart) goodputChart.destroy();
+            if (latencyChart) latencyChart.destroy();
+            if (allocChart) allocChart.destroy();
+            if (fairnessChart) fairnessChart.destroy();
 
-                    allocationChart.data.datasets[0].data = data.final_allocations;
-                    allocationChart.update();
-                })
-                .finally(() => {
-                    btn.textContent = 'Run Simulation';
-                    btn.disabled = false;
+            goodputChart = makeLineChart(goodputCtx, 'Goodput', '#1b8f6a');
+            latencyChart = makeLineChart(latencyCtx, 'Latency (ms)', '#9d6128');
+            allocChart = makeBarChart(allocCtx, 'Avg S_i', 'rgba(20,84,63,0.75)');
+            fairnessChart = makeBarChart(fairnessCtx, 'x/S', 'rgba(40,123,163,0.75)');
+        }
+
+        function statCard(label, value) {
+            return `<div class="card"><div class="label">${label}</div><div class="value">${value}</div></div>`;
+        }
+
+        function setStats(summary) {
+            const speed = summary.speedup_ratio > 0 ? `${summary.speedup_ratio.toFixed(2)}x` : 'N/A';
+            statsEl.innerHTML = [
+                statCard('Total Slots', summary.total_slots),
+                statCard('Emitted Tokens', summary.total_emitted_tokens),
+                statCard('Accepted Tokens', summary.total_accepted_tokens),
+                statCard('Speculative Time', `${summary.speculative_time_s.toFixed(2)}s`),
+                statCard('Baseline Time', `${summary.baseline_time_s.toFixed(2)}s`),
+                statCard('Speculative tok/s', summary.speculative_toks_per_s.toFixed(2)),
+                statCard('Baseline tok/s', summary.baseline_toks_per_s.toFixed(2)),
+                statCard('Speedup', speed),
+            ].join('');
+        }
+
+        function updateCharts(data) {
+            const labels = Array.from({ length: data.slot_goodput_history.length }, (_, i) => i + 1);
+
+            goodputChart.data.labels = labels;
+            goodputChart.data.datasets[0].data = data.slot_goodput_history;
+            goodputChart.update();
+
+            latencyChart.data.labels = labels;
+            latencyChart.data.datasets[0].data = data.slot_latency_ms;
+            latencyChart.update();
+
+            allocChart.data.labels = data.client_labels;
+            allocChart.data.datasets[0].data = data.avg_allocations;
+            allocChart.update();
+
+            fairnessChart.data.labels = data.client_labels;
+            fairnessChart.data.datasets[0].data = data.fairness;
+            fairnessChart.update();
+        }
+
+        initCharts();
+
+        runBtn.addEventListener('click', async () => {
+            runBtn.disabled = true;
+            statusEl.textContent = 'Running real model inference... this can take a while.';
+            saveBtn.style.display = 'none';
+            try {
+                const config = {
+                    num_clients: parseInt(numClientsInp.value, 10),
+                    total_slots: parseInt(totalSlotsInp.value, 10),
+                    cloud_capacity: parseInt(cloudCapacityInp.value, 10),
+                    eta: parseFloat(etaInp.value),
+                    beta: parseFloat(betaInp.value),
+                    initial_prompt: initialPromptInp.value,
+                };
+                const response = await fetch('/api/run', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({config}),
                 });
+                const data = await response.json();
+                setStats(data.summary);
+                updateCharts(data);
+                finalTextEl.textContent = data.final_text || '(empty)';
+                statusEl.textContent = 'Done';
+
+                // prepare download link
+                const blob = new Blob([JSON.stringify(data, null, 2)], {type: 'application/json'});
+                const url = URL.createObjectURL(blob);
+                saveBtn.href = url;
+                saveBtn.download = `run_${Date.now()}.json`;
+                saveBtn.style.display = 'inline-block';
+            } catch (err) {
+                statusEl.textContent = `Failed: ${err.message}`;
+            } finally {
+                runBtn.disabled = false;
+            }
         });
-        
-        // Initial empty charts
-        createCharts([]);
     </script>
 </body>
 </html>
 """
 
+
 class Handler(http.server.SimpleHTTPRequestHandler):
     def do_GET(self):
-        if self.path == '/':
+        if self.path == "/":
             self.send_response(200)
-            self.send_header('Content-type', 'text/html')
+            self.send_header("Content-type", "text/html")
             self.end_headers()
-            self.wfile.write(HTML_TEMPLATE.encode('utf-8'))
-        elif self.path == '/api/run':
-            self.send_response(200)
-            self.send_header('Content-type', 'application/json')
-            self.end_headers()
-            sim_data = run_simulation()
-            self.wfile.write(json.dumps(sim_data).encode('utf-8'))
-        else:
-            self.send_error(404, "File Not Found")
+            self.wfile.write(HTML_TEMPLATE.encode("utf-8"))
+            return
 
-# --- 5. Server Startup ---
+        # keep GET route for backwards compatibility, but warn that POST is preferred
+        if self.path == "/api/run":
+            try:
+                sim_data = SERVICE.run()
+                body = json.dumps(sim_data).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-type", "application/json")
+                self.end_headers()
+                self.wfile.write(body)
+            except Exception as exc:
+                body = json.dumps({"error": str(exc)}).encode("utf-8")
+                self.send_response(500)
+                self.send_header("Content-type", "application/json")
+                self.end_headers()
+                self.wfile.write(body)
+            return
+
+        self.send_error(404, "File Not Found")
+
+    def do_POST(self):
+        if self.path == "/api/run":
+            length = int(self.headers.get("Content-Length", 0))
+            post_data = self.rfile.read(length).decode("utf-8")
+            try:
+                payload = json.loads(post_data) if post_data else {}
+            except json.JSONDecodeError:
+                payload = {}
+
+            try:
+                sim_data = SERVICE.run(payload.get("config"))
+                body = json.dumps(sim_data).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-type", "application/json")
+                self.end_headers()
+                self.wfile.write(body)
+            except Exception as exc:
+                body = json.dumps({"error": str(exc)}).encode("utf-8")
+                self.send_response(500)
+                self.send_header("Content-type", "application/json")
+                self.end_headers()
+                self.wfile.write(body)
+            return
+
+        self.send_error(404, "File Not Found")
+
+
 def run_server(port=8000):
-    """
-    Starts the HTTP server.
-    """
     with socketserver.TCPServer(("", port), Handler) as httpd:
         print(f"Serving at http://localhost:{port}")
-        # Open the web browser automatically
-        threading.Timer(1, lambda: __import__('webbrowser').open(f'http://localhost:{port}')).start()
         httpd.serve_forever()
+
 
 if __name__ == "__main__":
     run_server()

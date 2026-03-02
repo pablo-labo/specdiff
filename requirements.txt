@@ -1,7 +1,6 @@
 numpy
-torch
-transformers
-accelerate
-bitsandbytes
+transformers>=4.36.0
+accelerate>=0.25.0
+bitsandbytes>=0.41.0
 scipy
 pytest

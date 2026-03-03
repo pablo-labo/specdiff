@@ -282,11 +282,17 @@ HTML_TEMPLATE = """
             border: 1px solid var(--line);
             border-radius: 12px;
             padding: 10px;
-            min-height: 290px;
+            height: 320px;
+            overflow: hidden;
         }
         .panel h3 {
             margin: 4px 0 12px;
             font-size: 15px;
+        }
+        .panel canvas {
+            width: 100% !important;
+            height: 260px !important;
+            display: block;
         }
         .text-panel {
             margin-top: 14px;

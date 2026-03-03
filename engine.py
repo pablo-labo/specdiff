@@ -33,9 +33,20 @@ class RealSpeculativeEngine:
         )
         
         self.current_prompt_ids = None
+        self.client_prompt_ids = []
 
     def set_prompt(self, text):
         self.current_prompt_ids = self.tokenizer.encode(text, return_tensors="pt").to(self.device)
+        self.client_prompt_ids = [self.current_prompt_ids.clone()]
+
+    def set_prompts(self, texts):
+        self.client_prompt_ids = [
+            self.tokenizer.encode(text, return_tensors="pt").to(self.device) for text in texts
+        ]
+        self.current_prompt_ids = self.client_prompt_ids[0].clone()
+
+    def get_prompt_ids_clone(self, client_idx):
+        return self.client_prompt_ids[client_idx].clone()
 
     def step(self, draft_length_S):
         """
@@ -44,6 +55,9 @@ class RealSpeculativeEngine:
         2. Target verifies them.
         Returns: (accepted_length, accepted_token_ids)
         """
+        if self.current_prompt_ids is None:
+            raise ValueError("Prompt is not initialized. Call set_prompt first.")
+
         if draft_length_S == 0:
             return 0, torch.tensor([], device=self.device)
 
@@ -81,9 +95,31 @@ class RealSpeculativeEngine:
         
         return accepted_len, torch.tensor(accepted_tokens, device=self.device)
 
+    def step_for_client(self, client_idx, draft_length_S):
+        if not self.client_prompt_ids:
+            raise ValueError("Prompts are not initialized. Call set_prompts first.")
+
+        self.current_prompt_ids = self.client_prompt_ids[client_idx]
+        accepted_len, accepted_tokens = self.step(draft_length_S)
+        return accepted_len, accepted_tokens
+
     def update_prompt(self, new_tokens):
         if len(new_tokens) > 0:
             self.current_prompt_ids = torch.cat([self.current_prompt_ids, new_tokens.unsqueeze(0)], dim=1)
 
+    def update_prompt_for_client(self, client_idx, new_tokens):
+        if not self.client_prompt_ids:
+            raise ValueError("Prompts are not initialized. Call set_prompts first.")
+
+        self.current_prompt_ids = self.client_prompt_ids[client_idx]
+        self.update_prompt(new_tokens)
+        self.client_prompt_ids[client_idx] = self.current_prompt_ids
+
     def decode(self):
         return self.tokenizer.decode(self.current_prompt_ids[0], skip_special_tokens=True)
+
+    def decode_client(self, client_idx):
+        return self.tokenizer.decode(self.client_prompt_ids[client_idx][0], skip_special_tokens=True)
+
+    def decode_all(self):
+        return [self.decode_client(i) for i in range(len(self.client_prompt_ids))]

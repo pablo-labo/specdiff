@@ -20,6 +20,7 @@ class RunConfig:
     eta: float = 0.1
     beta: float = 0.1
     initial_prompt: str = "The future of artificial intelligence depends on"
+    initial_prompts: Optional[list[str]] = None
     target_model_name: str = "Qwen/Qwen2.5-7B-Instruct"
     draft_model_name: str = "Qwen/Qwen2.5-0.5B-Instruct"
 
@@ -28,7 +29,17 @@ class RunConfig:
     def from_dict(cls, data: dict) -> "RunConfig":
         # only use known fields, ignore extras
         kwargs = {}
-        for field in ("num_clients", "total_slots", "cloud_capacity", "eta", "beta", "initial_prompt", "target_model_name", "draft_model_name"):
+        for field in (
+            "num_clients",
+            "total_slots",
+            "cloud_capacity",
+            "eta",
+            "beta",
+            "initial_prompt",
+            "initial_prompts",
+            "target_model_name",
+            "draft_model_name",
+        ):
             if field in data:
                 kwargs[field] = data[field]
         return cls(**kwargs)
@@ -68,6 +79,10 @@ class RealRunService:
 
         engine = self._ensure_engine()
         cfg = self.config
+        if cfg.initial_prompts and len(cfg.initial_prompts) == cfg.num_clients:
+            client_prompts = cfg.initial_prompts
+        else:
+            client_prompts = [f"[Client {i}] {cfg.initial_prompt}" for i in range(cfg.num_clients)]
 
         scheduler = GradientScheduler(capacity=cfg.cloud_capacity)
         clients = [ClientState(eta=cfg.eta, beta=cfg.beta) for _ in range(cfg.num_clients)]
@@ -77,24 +92,39 @@ class RealRunService:
         slot_goodput_history = []
         slot_latency_ms = []
 
-        engine.set_prompt(cfg.initial_prompt)
-        initial_prompt_ids = engine.current_prompt_ids.clone()
+        engine.set_prompts(client_prompts)
+        initial_prompt_ids = [engine.get_prompt_ids_clone(i) for i in range(cfg.num_clients)]
 
         total_accepted_tokens = 0
         total_emitted_tokens = 0
+        emitted_tokens_per_client = [0 for _ in range(cfg.num_clients)]
         speculative_start = time.perf_counter()
 
         for t in range(cfg.total_slots):
             slot_start = time.perf_counter()
             S_allocations = scheduler.allocate(clients)
             slot_total_goodput = 0
+            client_step_outputs = []
+            client_step_latencies = []
 
             for i in range(cfg.num_clients):
                 S_i = int(S_allocations[i])
-                l_i, new_tokens = engine.step(draft_length_S=S_i)
-                engine.update_prompt(new_tokens)
+                client_step_start = time.perf_counter()
+                l_i, new_tokens = engine.step_for_client(client_idx=i, draft_length_S=S_i)
+                client_step_elapsed = time.perf_counter() - client_step_start
+                engine.update_prompt_for_client(client_idx=i, new_tokens=new_tokens)
+                client_step_outputs.append((S_i, l_i, len(new_tokens)))
+                client_step_latencies.append(client_step_elapsed)
+                total_accepted_tokens += int(l_i)
+                total_emitted_tokens += int(len(new_tokens))
+                emitted_tokens_per_client[i] += int(len(new_tokens))
 
-                x_i = 1 + l_i
+            # Simulated parallel slot duration uses slowest client runtime.
+            slot_time_s = max(client_step_latencies) if client_step_latencies else 1e-6
+            slot_time_s = max(slot_time_s, 1e-6)
+            for i in range(cfg.num_clients):
+                S_i, l_i, _ = client_step_outputs[i]
+                x_i = (1 + l_i) / slot_time_s
                 tilda_alpha = l_i / S_i if S_i > 0 else 0.0
                 clients[i].hat_alpha = update_alpha(clients[i].hat_alpha, tilda_alpha, clients[i].eta)
                 clients[i].X = update_X(clients[i].X, x_i, clients[i].beta)
@@ -102,14 +132,11 @@ class RealRunService:
                 history_allocations[t, i] = S_i
                 history_goodputs[t, i] = x_i
                 slot_total_goodput += x_i
-                total_accepted_tokens += int(l_i)
-                total_emitted_tokens += int(len(new_tokens))
 
             slot_goodput_history.append(float(slot_total_goodput))
             slot_latency_ms.append((time.perf_counter() - slot_start) * 1000.0)
 
         speculative_time_s = time.perf_counter() - speculative_start
-        final_text = engine.decode()
 
         # Baseline: target model greedy generation for the same emitted token count.
         baseline_time_s = 0.0
@@ -118,13 +145,16 @@ class RealRunService:
 
             with torch.no_grad():
                 baseline_start = time.perf_counter()
-                _ = engine.target_model.generate(
-                    initial_prompt_ids,
-                    max_new_tokens=total_emitted_tokens,
-                    do_sample=False,
-                    use_cache=True,
-                    pad_token_id=engine.tokenizer.eos_token_id,
-                )
+                for i in range(cfg.num_clients):
+                    if emitted_tokens_per_client[i] <= 0:
+                        continue
+                    _ = engine.target_model.generate(
+                        initial_prompt_ids[i],
+                        max_new_tokens=emitted_tokens_per_client[i],
+                        do_sample=False,
+                        use_cache=True,
+                        pad_token_id=engine.tokenizer.eos_token_id,
+                    )
                 baseline_time_s = time.perf_counter() - baseline_start
 
         speculative_toks_per_s = (
@@ -142,6 +172,11 @@ class RealRunService:
             for i in range(cfg.num_clients)
         ]
 
+        final_texts = engine.decode_all()
+        merged_final_text = "\n\n".join(
+            [f"[Client {i}] {text}" for i, text in enumerate(final_texts)]
+        )
+
         result = {
             "slot_goodput_history": slot_goodput_history,
             "slot_latency_ms": [float(v) for v in slot_latency_ms],
@@ -150,7 +185,9 @@ class RealRunService:
             "fairness": fairness,
             "client_labels": [f"Client {i}" for i in range(cfg.num_clients)],
             "initial_prompt": cfg.initial_prompt,
-            "final_text": final_text,
+            "initial_prompts": client_prompts,
+            "final_text": merged_final_text,
+            "final_texts": final_texts,
             "summary": {
                 "total_slots": cfg.total_slots,
                 "total_emitted_tokens": total_emitted_tokens,

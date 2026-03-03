@@ -2,7 +2,7 @@ import numpy as np
 from core import ClientState, update_alpha, update_X
 from scheduler import GradientScheduler
 from engine import RealSpeculativeEngine
-import torch
+import time
 
 # --- 1. Simulation Environment Configuration ---
 NUM_CLIENTS = 3  # Modified to 3 as requested (using 0.5B model)
@@ -11,6 +11,11 @@ CLOUD_CAPACITY = 20
 NUM_DRAFTS_K = 3
 ETA = 0.1  # Learning rate for alpha smoothing
 BETA = 0.1 # Learning rate for X smoothing
+INITIAL_PROMPTS = [
+    "Write a concise summary of why speculative decoding improves inference throughput.",
+    "Draft a short explanation of fairness-aware scheduling in multi-client model serving.",
+    "Explain the tradeoff between draft length and acceptance rate in speculative decoding.",
+]
 
 def simulate_best_of_k_selection(draft_length: int, true_alpha: float, k: int) -> int:
     """
@@ -52,9 +57,12 @@ def run_simulation():
     print("Initializing AI Models (Qwen2.5-7B & 0.5B)...")
     # Ensure you have installed: pip install transformers accelerate bitsandbytes
     engine = RealSpeculativeEngine("Qwen/Qwen2.5-7B-Instruct", "Qwen/Qwen2.5-0.5B-Instruct")
-    initial_prompt = "The future of artificial intelligence depends on"
-    engine.set_prompt(initial_prompt)
-    print(f"Initial Prompt: {initial_prompt}")
+    if len(INITIAL_PROMPTS) != NUM_CLIENTS:
+        raise ValueError("INITIAL_PROMPTS length must match NUM_CLIENTS.")
+    engine.set_prompts(INITIAL_PROMPTS)
+    print("Initial Prompts:")
+    for i, prompt in enumerate(INITIAL_PROMPTS):
+        print(f"  Client {i}: {prompt}")
 
     # Data stores for metrics
     history_allocations = np.zeros((TOTAL_SLOTS, NUM_CLIENTS))
@@ -69,40 +77,47 @@ def run_simulation():
         S_allocations = scheduler.allocate(clients)
         
         total_goodput_in_slot = 0
+        client_step_outputs = []
+        client_step_latencies = []
         
         for i in range(NUM_CLIENTS):
             S_i = S_allocations[i]
             
             # 2. Real Inference Step
-            # We treat each 'client' as a worker trying to extend the prompt.
-            # In a real distributed system, they might work on different requests,
-            # but here we collaborate on one prompt for demonstration.
-            l_i, new_tokens = engine.step(draft_length_S=S_i)
+            # Each client evolves its own independent prompt/context.
+            step_start = time.perf_counter()
+            l_i, new_tokens = engine.step_for_client(client_idx=i, draft_length_S=S_i)
+            elapsed = time.perf_counter() - step_start
             
-            # Update the prompt with accepted tokens so the next client continues
-            engine.update_prompt(new_tokens)
+            # Update only this client's prompt.
+            engine.update_prompt_for_client(client_idx=i, new_tokens=new_tokens)
+            client_step_outputs.append((S_i, l_i, len(new_tokens)))
+            client_step_latencies.append(elapsed)
 
-            # Realized Goodput: x_i = 1 + l_i [cite: 53]
-            x_i = 1 + l_i
-            
+        # Simulated parallel slot duration uses the slowest client in the slot.
+        slot_time_s = max(client_step_latencies) if client_step_latencies else 1e-6
+        slot_time_s = max(slot_time_s, 1e-6)
+
+        for i in range(NUM_CLIENTS):
+            S_i, l_i, _ = client_step_outputs[i]
+            # Time-aware goodput under parallel-slot approximation.
+            x_i = (1 + l_i) / slot_time_s
+
             # 4. State Update [cite: 131]
-            # Observed acceptance rate for the selected draft.
             tilda_alpha = l_i / S_i if S_i > 0 else 0.0
-            
-            # Update client's internal state estimates.
             clients[i].hat_alpha = update_alpha(clients[i].hat_alpha, tilda_alpha, clients[i].eta)
             clients[i].X = update_X(clients[i].X, x_i, clients[i].beta)
 
-            # Store metrics
             history_allocations[t, i] = S_i
             history_goodputs[t, i] = x_i
             total_goodput_in_slot += x_i
 
         # --- Data Monitoring ---
         utilization = np.sum(S_allocations) / CLOUD_CAPACITY
-        print(f"Slot {t+1: >3}/{TOTAL_SLOTS} | Total Goodput: {total_goodput_in_slot: >4.1f} | Utilization: {utilization: >4.1%}")
-        # Optional: Print current generation
-        # print(f"Current Text: {engine.decode()}")
+        print(
+            f"Slot {t+1: >3}/{TOTAL_SLOTS} | Total Goodput: {total_goodput_in_slot: >8.2f} "
+            f"| SlotTime(max): {slot_time_s*1000: >7.1f} ms | Utilization: {utilization: >4.1%}"
+        )
 
     # --- 3. Final Report ---
     print("\n" + "=" * 60)
@@ -120,8 +135,9 @@ def run_simulation():
         print(f"{i: >8} | {'N/A': >8} | {avg_allocations[i]: >8.2f} | {avg_goodputs[i]: >8.2f} | {fairness: >15.2f}")
     print("-" * 60)
     
-    print("\nFinal Generated Text:")
-    print(engine.decode())
+    print("\nFinal Generated Texts:")
+    for i, text in enumerate(engine.decode_all()):
+        print(f"[Client {i}] {text}")
 
 
 if __name__ == "__main__":

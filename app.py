@@ -79,10 +79,12 @@ class RealRunService:
 
         engine = self._ensure_engine()
         cfg = self.config
+        # Keep simulation shape stable for dashboard semantics.
+        cfg.num_clients = 3
         if cfg.initial_prompts and len(cfg.initial_prompts) == cfg.num_clients:
             client_prompts = cfg.initial_prompts
         else:
-            client_prompts = [f"[Client {i}] {cfg.initial_prompt}" for i in range(cfg.num_clients)]
+            client_prompts = [cfg.initial_prompt for _ in range(cfg.num_clients)]
 
         scheduler = GradientScheduler(capacity=cfg.cloud_capacity)
         clients = [ClientState(eta=cfg.eta, beta=cfg.beta) for _ in range(cfg.num_clients)]
@@ -173,9 +175,7 @@ class RealRunService:
         ]
 
         final_texts = engine.decode_all()
-        merged_final_text = "\n\n".join(
-            [f"[Client {i}] {text}" for i, text in enumerate(final_texts)]
-        )
+        merged_final_text = "\n\n".join(final_texts)
 
         result = {
             "slot_goodput_history": slot_goodput_history,
@@ -449,6 +449,29 @@ HTML_TEMPLATE = """
             return `<div class="card"><div class="label">${label}</div><div class="value">${value}</div></div>`;
         }
 
+        function escapeHtml(text) {
+            return String(text)
+                .replaceAll('&', '&amp;')
+                .replaceAll('<', '&lt;')
+                .replaceAll('>', '&gt;')
+                .replaceAll('"', '&quot;')
+                .replaceAll("'", '&#39;');
+        }
+
+        function renderFinalTexts(data) {
+            if (Array.isArray(data.final_texts) && data.final_texts.length > 0) {
+                const blocks = data.final_texts.map((text, idx) => {
+                    return `<div style="margin-bottom:16px;">
+                        <div class="label">Client ${idx}</div>
+                        <div style="white-space:pre-wrap; line-height:1.5;">${escapeHtml(text)}</div>
+                    </div>`;
+                });
+                finalTextEl.innerHTML = blocks.join('');
+                return;
+            }
+            finalTextEl.textContent = data.final_text || '(empty)';
+        }
+
         function setStats(summary) {
             const speed = summary.speedup_ratio > 0 ? `${summary.speedup_ratio.toFixed(2)}x` : 'N/A';
             statsEl.innerHTML = [
@@ -506,7 +529,7 @@ HTML_TEMPLATE = """
                 const data = await response.json();
                 setStats(data.summary);
                 updateCharts(data);
-                finalTextEl.textContent = data.final_text || '(empty)';
+                renderFinalTexts(data);
                 statusEl.textContent = 'Done';
 
                 // prepare download link

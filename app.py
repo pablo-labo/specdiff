@@ -93,6 +93,7 @@ class RealRunService:
         history_goodputs = np.zeros((cfg.total_slots, cfg.num_clients))
         slot_goodput_history = []
         slot_latency_ms = []
+        slot_wall_latency_ms = []
 
         engine.set_prompts(client_prompts)
         initial_prompt_ids = [engine.get_prompt_ids_clone(i) for i in range(cfg.num_clients)]
@@ -101,29 +102,35 @@ class RealRunService:
         total_emitted_tokens = 0
         emitted_tokens_per_client = [0 for _ in range(cfg.num_clients)]
         speculative_start = time.perf_counter()
+        speculative_virtual_time_s = 0.0
 
         for t in range(cfg.total_slots):
             slot_start = time.perf_counter()
             S_allocations = scheduler.allocate(clients)
             slot_total_goodput = 0
             client_step_outputs = []
-            client_step_latencies = []
+            draft_times = []
+            verify_times = []
 
             for i in range(cfg.num_clients):
                 S_i = int(S_allocations[i])
-                client_step_start = time.perf_counter()
-                l_i, new_tokens = engine.step_for_client(client_idx=i, draft_length_S=S_i)
-                client_step_elapsed = time.perf_counter() - client_step_start
+                l_i, new_tokens, draft_time_s, verify_time_s = engine.step_for_client_timed(
+                    client_idx=i, draft_length_S=S_i
+                )
                 engine.update_prompt_for_client(client_idx=i, new_tokens=new_tokens)
                 client_step_outputs.append((S_i, l_i, len(new_tokens)))
-                client_step_latencies.append(client_step_elapsed)
+                draft_times.append(draft_time_s)
+                verify_times.append(verify_time_s)
                 total_accepted_tokens += int(l_i)
                 total_emitted_tokens += int(len(new_tokens))
                 emitted_tokens_per_client[i] += int(len(new_tokens))
 
-            # Simulated parallel slot duration uses slowest client runtime.
-            slot_time_s = max(client_step_latencies) if client_step_latencies else 1e-6
+            # Virtual parallel slot time:
+            # draft is parallel across clients -> max(draft_times),
+            # verification is shared/serial -> sum(verify_times).
+            slot_time_s = (max(draft_times) if draft_times else 0.0) + sum(verify_times)
             slot_time_s = max(slot_time_s, 1e-6)
+            speculative_virtual_time_s += slot_time_s
             for i in range(cfg.num_clients):
                 S_i, l_i, _ = client_step_outputs[i]
                 x_i = (1 + l_i) / slot_time_s
@@ -136,9 +143,11 @@ class RealRunService:
                 slot_total_goodput += x_i
 
             slot_goodput_history.append(float(slot_total_goodput))
-            slot_latency_ms.append((time.perf_counter() - slot_start) * 1000.0)
+            slot_latency_ms.append(slot_time_s * 1000.0)
+            slot_wall_latency_ms.append((time.perf_counter() - slot_start) * 1000.0)
 
-        speculative_time_s = time.perf_counter() - speculative_start
+        speculative_wall_time_s = time.perf_counter() - speculative_start
+        speculative_time_s = speculative_virtual_time_s
 
         # Baseline: target model greedy generation for the same emitted token count.
         baseline_time_s = 0.0
@@ -193,11 +202,13 @@ class RealRunService:
                 "total_emitted_tokens": total_emitted_tokens,
                 "total_accepted_tokens": total_accepted_tokens,
                 "speculative_time_s": speculative_time_s,
+                "speculative_wall_time_s": speculative_wall_time_s,
                 "baseline_time_s": baseline_time_s,
                 "speculative_toks_per_s": speculative_toks_per_s,
                 "baseline_toks_per_s": baseline_toks_per_s,
                 "speedup_ratio": speedup_ratio,
             },
+            "slot_wall_latency_ms": [float(v) for v in slot_wall_latency_ms],
         }
         # persist to local file for later inspection
         try:

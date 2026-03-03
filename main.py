@@ -2,7 +2,6 @@ import numpy as np
 from core import ClientState, update_alpha, update_X
 from scheduler import GradientScheduler
 from engine import RealSpeculativeEngine
-import time
 
 # --- 1. Simulation Environment Configuration ---
 NUM_CLIENTS = 3  # Modified to 3 as requested (using 0.5B model)
@@ -78,24 +77,27 @@ def run_simulation():
         
         total_goodput_in_slot = 0
         client_step_outputs = []
-        client_step_latencies = []
+        draft_times = []
+        verify_times = []
         
         for i in range(NUM_CLIENTS):
             S_i = S_allocations[i]
             
             # 2. Real Inference Step
             # Each client evolves its own independent prompt/context.
-            step_start = time.perf_counter()
-            l_i, new_tokens = engine.step_for_client(client_idx=i, draft_length_S=S_i)
-            elapsed = time.perf_counter() - step_start
+            l_i, new_tokens, draft_time_s, verify_time_s = engine.step_for_client_timed(
+                client_idx=i, draft_length_S=S_i
+            )
             
             # Update only this client's prompt.
             engine.update_prompt_for_client(client_idx=i, new_tokens=new_tokens)
             client_step_outputs.append((S_i, l_i, len(new_tokens)))
-            client_step_latencies.append(elapsed)
+            draft_times.append(draft_time_s)
+            verify_times.append(verify_time_s)
 
-        # Simulated parallel slot duration uses the slowest client in the slot.
-        slot_time_s = max(client_step_latencies) if client_step_latencies else 1e-6
+        # Virtual parallel slot time:
+        # parallel draft stage + shared serial verification stage.
+        slot_time_s = (max(draft_times) if draft_times else 0.0) + sum(verify_times)
         slot_time_s = max(slot_time_s, 1e-6)
 
         for i in range(NUM_CLIENTS):

@@ -1,5 +1,6 @@
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+import time
 
 class RealSpeculativeEngine:
     def __init__(self, target_model_name, draft_model_name, device="cuda"):
@@ -95,6 +96,50 @@ class RealSpeculativeEngine:
         
         return accepted_len, torch.tensor(accepted_tokens, device=self.device)
 
+    def step_timed(self, draft_length_S):
+        """
+        Same as step(), but returns timing breakdown:
+        (accepted_len, accepted_tokens, draft_time_s, verify_time_s)
+        """
+        if self.current_prompt_ids is None:
+            raise ValueError("Prompt is not initialized. Call set_prompt first.")
+
+        if draft_length_S == 0:
+            return 0, torch.tensor([], device=self.device), 0.0, 0.0
+
+        draft_start = time.perf_counter()
+        draft_outputs = self.draft_model.generate(
+            self.current_prompt_ids,
+            max_new_tokens=draft_length_S,
+            do_sample=False,
+            use_cache=True,
+            pad_token_id=self.tokenizer.eos_token_id
+        )
+        draft_time_s = time.perf_counter() - draft_start
+        draft_tokens = draft_outputs[0, self.current_prompt_ids.shape[1]:]
+
+        verify_start = time.perf_counter()
+        with torch.no_grad():
+            target_outputs = self.target_model(draft_outputs)
+            logits = target_outputs.logits
+
+        start_idx = self.current_prompt_ids.shape[1] - 1
+        end_idx = start_idx + len(draft_tokens)
+        target_preds = torch.argmax(logits[0, start_idx:end_idx], dim=-1)
+
+        accepted_len = 0
+        accepted_tokens = []
+        for i in range(len(draft_tokens)):
+            if draft_tokens[i] == target_preds[i]:
+                accepted_len += 1
+                accepted_tokens.append(draft_tokens[i])
+            else:
+                accepted_tokens.append(target_preds[i])
+                break
+        verify_time_s = time.perf_counter() - verify_start
+
+        return accepted_len, torch.tensor(accepted_tokens, device=self.device), draft_time_s, verify_time_s
+
     def step_for_client(self, client_idx, draft_length_S):
         if not self.client_prompt_ids:
             raise ValueError("Prompts are not initialized. Call set_prompts first.")
@@ -102,6 +147,14 @@ class RealSpeculativeEngine:
         self.current_prompt_ids = self.client_prompt_ids[client_idx]
         accepted_len, accepted_tokens = self.step(draft_length_S)
         return accepted_len, accepted_tokens
+
+    def step_for_client_timed(self, client_idx, draft_length_S):
+        if not self.client_prompt_ids:
+            raise ValueError("Prompts are not initialized. Call set_prompts first.")
+
+        self.current_prompt_ids = self.client_prompt_ids[client_idx]
+        accepted_len, accepted_tokens, draft_time_s, verify_time_s = self.step_timed(draft_length_S)
+        return accepted_len, accepted_tokens, draft_time_s, verify_time_s
 
     def update_prompt(self, new_tokens):
         if len(new_tokens) > 0:

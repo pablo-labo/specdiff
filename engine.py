@@ -2,6 +2,20 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 import time
 
+
+def _sample_residual_token(p_probs: torch.Tensor, q_probs: torch.Tensor) -> torch.Tensor:
+    """
+    Sample one token from the normalized residual distribution:
+        r(x) ∝ max(0, p(x) - q(x))
+    If the residual mass is numerically zero, fall back to sampling from p.
+    """
+    residual = torch.clamp(p_probs - q_probs, min=0.0)
+    residual_mass = residual.sum()
+    if residual_mass <= 1e-12:
+        return torch.multinomial(p_probs, num_samples=1).squeeze(0)
+    residual = residual / residual_mass
+    return torch.multinomial(residual, num_samples=1).squeeze(0)
+
 class RealSpeculativeEngine:
     def __init__(self, target_model_name, draft_model_name, device="cuda"):
         print(f"Loading models on {device} with 4-bit quantization...")
@@ -76,24 +90,37 @@ class RealSpeculativeEngine:
         with torch.no_grad():
             target_outputs = self.target_model(draft_outputs)
             logits = target_outputs.logits
+            draft_logits = self.draft_model(draft_outputs).logits
 
         start_idx = self.current_prompt_ids.shape[1] - 1
         end_idx = start_idx + len(draft_tokens)
-        
-        target_preds = torch.argmax(logits[0, start_idx:end_idx], dim=-1)
+
+        p_logits = logits[0, start_idx:end_idx]
+        q_logits = draft_logits[0, start_idx:end_idx]
+        p_probs_all = torch.softmax(p_logits, dim=-1)
+        q_probs_all = torch.softmax(q_logits, dim=-1)
 
         # --- 3. Compare ---
         accepted_len = 0
         accepted_tokens = []
-        
+
         for i in range(len(draft_tokens)):
-            if draft_tokens[i] == target_preds[i]:
+            token_id = draft_tokens[i]
+            p_probs = p_probs_all[i]
+            q_probs = q_probs_all[i]
+
+            p_token = p_probs[token_id]
+            q_token = torch.clamp(q_probs[token_id], min=1e-12)
+            accept_prob = torch.clamp(p_token / q_token, max=1.0)
+
+            if torch.rand((), device=self.device) < accept_prob:
                 accepted_len += 1
-                accepted_tokens.append(draft_tokens[i])
+                accepted_tokens.append(token_id)
             else:
-                accepted_tokens.append(target_preds[i]) 
+                replacement = _sample_residual_token(p_probs, q_probs)
+                accepted_tokens.append(replacement)
                 break
-        
+
         return accepted_len, torch.tensor(accepted_tokens, device=self.device)
 
     def step_timed(self, draft_length_S):
@@ -122,19 +149,33 @@ class RealSpeculativeEngine:
         with torch.no_grad():
             target_outputs = self.target_model(draft_outputs)
             logits = target_outputs.logits
+            draft_logits = self.draft_model(draft_outputs).logits
 
         start_idx = self.current_prompt_ids.shape[1] - 1
         end_idx = start_idx + len(draft_tokens)
-        target_preds = torch.argmax(logits[0, start_idx:end_idx], dim=-1)
+
+        p_logits = logits[0, start_idx:end_idx]
+        q_logits = draft_logits[0, start_idx:end_idx]
+        p_probs_all = torch.softmax(p_logits, dim=-1)
+        q_probs_all = torch.softmax(q_logits, dim=-1)
 
         accepted_len = 0
         accepted_tokens = []
         for i in range(len(draft_tokens)):
-            if draft_tokens[i] == target_preds[i]:
+            token_id = draft_tokens[i]
+            p_probs = p_probs_all[i]
+            q_probs = q_probs_all[i]
+
+            p_token = p_probs[token_id]
+            q_token = torch.clamp(q_probs[token_id], min=1e-12)
+            accept_prob = torch.clamp(p_token / q_token, max=1.0)
+
+            if torch.rand((), device=self.device) < accept_prob:
                 accepted_len += 1
-                accepted_tokens.append(draft_tokens[i])
+                accepted_tokens.append(token_id)
             else:
-                accepted_tokens.append(target_preds[i])
+                replacement = _sample_residual_token(p_probs, q_probs)
+                accepted_tokens.append(replacement)
                 break
         verify_time_s = time.perf_counter() - verify_start
 

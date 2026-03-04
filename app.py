@@ -103,7 +103,9 @@ class RealRunService:
 
         history_allocations = np.zeros((cfg.total_slots, cfg.num_clients))
         history_goodputs = np.zeros((cfg.total_slots, cfg.num_clients))
+        history_aoi_s = np.full((cfg.total_slots, cfg.num_clients), np.nan)
         slot_goodput_history = []
+        slot_aoi_history_s = []
         slot_latency_ms = []
         slot_wall_latency_ms = []
 
@@ -145,18 +147,26 @@ class RealRunService:
             slot_time_s = barrier_wait_s + verify_stage_s + feedback_stage_s
             slot_time_s = max(slot_time_s, 1e-6)
             speculative_virtual_time_s += slot_time_s
+            finite_slot_aoi = []
             for i in range(cfg.num_clients):
                 S_i, l_i, _ = client_step_outputs[i]
-                x_i = (1 + l_i) / slot_time_s
+                x_i = l_i / slot_time_s
                 tilda_alpha = l_i / S_i if S_i > 0 else 0.0
                 clients[i].hat_alpha = update_alpha(clients[i].hat_alpha, tilda_alpha, clients[i].eta)
                 clients[i].X = update_X(clients[i].X, x_i, clients[i].beta)
 
                 history_allocations[t, i] = S_i
                 history_goodputs[t, i] = x_i
+                if l_i > 0:
+                    aoi_s = slot_time_s / l_i
+                    history_aoi_s[t, i] = aoi_s
+                    finite_slot_aoi.append(aoi_s)
                 slot_total_goodput += x_i
 
             slot_goodput_history.append(float(slot_total_goodput))
+            slot_aoi_history_s.append(
+                float(np.mean(finite_slot_aoi)) if finite_slot_aoi else None
+            )
             slot_latency_ms.append(slot_time_s * 1000.0)
             slot_wall_latency_ms.append((time.perf_counter() - slot_start) * 1000.0)
 
@@ -192,6 +202,8 @@ class RealRunService:
 
         avg_allocations = np.mean(history_allocations, axis=0)
         avg_goodputs = np.mean(history_goodputs, axis=0)
+        avg_aoi_s = np.nanmean(history_aoi_s, axis=0)
+        avg_aoi_s = np.where(np.isnan(avg_aoi_s), 0.0, avg_aoi_s)
         fairness = [
             float(avg_goodputs[i] / avg_allocations[i]) if avg_allocations[i] > 0 else 0.0
             for i in range(cfg.num_clients)
@@ -202,9 +214,15 @@ class RealRunService:
 
         result = {
             "slot_goodput_history": slot_goodput_history,
+            "slot_aoi_s": slot_aoi_history_s,
+            "slot_aoi_by_client_s": [
+                [float(v) if not np.isnan(v) else None for v in history_aoi_s[:, i]]
+                for i in range(cfg.num_clients)
+            ],
             "slot_latency_ms": [float(v) for v in slot_latency_ms],
             "avg_allocations": avg_allocations.tolist(),
             "avg_goodputs": avg_goodputs.tolist(),
+            "avg_aoi_s": avg_aoi_s.tolist(),
             "fairness": fairness,
             "client_labels": [f"Client {i}" for i in range(cfg.num_clients)],
             "initial_prompt": cfg.initial_prompt,
@@ -221,6 +239,11 @@ class RealRunService:
                 "speculative_toks_per_s": speculative_toks_per_s,
                 "baseline_toks_per_s": baseline_toks_per_s,
                 "speedup_ratio": speedup_ratio,
+                "avg_aoi_s_over_slots": float(
+                    np.mean([v for v in slot_aoi_history_s if v is not None])
+                )
+                if any(v is not None for v in slot_aoi_history_s)
+                else 0.0,
                 "objective_mode": cfg.objective_mode,
                 "objective_alpha": cfg.objective_alpha,
             },
@@ -409,6 +432,14 @@ HTML_TEMPLATE = """
                 <canvas id="goodputChart"></canvas>
             </div>
             <div class="panel">
+                <h3>Average AoI Per Slot (s/token)</h3>
+                <canvas id="aoiChart"></canvas>
+            </div>
+            <div class="panel">
+                <h3>Client AoI Per Slot (s/token)</h3>
+                <canvas id="aoiClientChart"></canvas>
+            </div>
+            <div class="panel">
                 <h3>Slot Latency (ms)</h3>
                 <canvas id="latencyChart"></canvas>
             </div>
@@ -417,7 +448,7 @@ HTML_TEMPLATE = """
                 <canvas id="allocChart"></canvas>
             </div>
             <div class="panel">
-                <h3>Fairness (x/S)</h3>
+                <h3>Fairness (R/S)</h3>
                 <canvas id="fairnessChart"></canvas>
             </div>
         </div>
@@ -430,6 +461,8 @@ HTML_TEMPLATE = """
 
     <script>
         const goodputCtx = document.getElementById('goodputChart').getContext('2d');
+        const aoiCtx = document.getElementById('aoiChart').getContext('2d');
+        const aoiClientCtx = document.getElementById('aoiClientChart').getContext('2d');
         const latencyCtx = document.getElementById('latencyChart').getContext('2d');
         const allocCtx = document.getElementById('allocChart').getContext('2d');
         const fairnessCtx = document.getElementById('fairnessChart').getContext('2d');
@@ -449,6 +482,8 @@ HTML_TEMPLATE = """
         const initialPromptInp = document.getElementById('initialPrompt');
 
         let goodputChart;
+        let aoiChart;
+        let aoiClientChart;
         let latencyChart;
         let allocChart;
         let fairnessChart;
@@ -471,14 +506,22 @@ HTML_TEMPLATE = """
 
         function initCharts() {
             if (goodputChart) goodputChart.destroy();
+            if (aoiChart) aoiChart.destroy();
+            if (aoiClientChart) aoiClientChart.destroy();
             if (latencyChart) latencyChart.destroy();
             if (allocChart) allocChart.destroy();
             if (fairnessChart) fairnessChart.destroy();
 
             goodputChart = makeLineChart(goodputCtx, 'Goodput', '#1b8f6a');
+            aoiChart = makeLineChart(aoiCtx, 'AoI (s/token)', '#4f5d55');
+            aoiClientChart = new Chart(aoiClientCtx, {
+                type: 'line',
+                data: { labels: [], datasets: [] },
+                options: { responsive: true, maintainAspectRatio: false }
+            });
             latencyChart = makeLineChart(latencyCtx, 'Latency (ms)', '#9d6128');
             allocChart = makeBarChart(allocCtx, 'Avg S_i', 'rgba(20,84,63,0.75)');
-            fairnessChart = makeBarChart(fairnessCtx, 'x/S', 'rgba(40,123,163,0.75)');
+            fairnessChart = makeBarChart(fairnessCtx, 'R/S', 'rgba(40,123,163,0.75)');
         }
 
         function statCard(label, value) {
@@ -519,6 +562,7 @@ HTML_TEMPLATE = """
                 statCard('Speculative tok/s', summary.speculative_toks_per_s.toFixed(2)),
                 statCard('Baseline tok/s', summary.baseline_toks_per_s.toFixed(2)),
                 statCard('Speedup', speed),
+                statCard('Avg AoI (s/token)', (summary.avg_aoi_s_over_slots ?? 0).toFixed(3)),
                 statCard('Objective', summary.objective_mode || 'paper_log_r'),
                 statCard('Obj α', (summary.objective_alpha ?? 1.0).toString()),
             ].join('');
@@ -542,6 +586,22 @@ HTML_TEMPLATE = """
             fairnessChart.data.labels = data.client_labels;
             fairnessChart.data.datasets[0].data = data.fairness;
             fairnessChart.update();
+
+            aoiChart.data.labels = labels;
+            aoiChart.data.datasets[0].data = data.slot_aoi_s || [];
+            aoiChart.update();
+
+            const clientSeries = data.slot_aoi_by_client_s || [];
+            const palette = ['#14543f', '#1b8f6a', '#287ba3', '#9d6128', '#7a3e9d'];
+            aoiClientChart.data.labels = labels;
+            aoiClientChart.data.datasets = clientSeries.map((series, idx) => ({
+                label: data.client_labels?.[idx] || `Client ${idx}`,
+                data: series,
+                borderColor: palette[idx % palette.length],
+                tension: 0.2,
+                fill: false,
+            }));
+            aoiClientChart.update();
         }
 
         initCharts();

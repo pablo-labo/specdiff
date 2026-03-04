@@ -75,6 +75,7 @@ def run_simulation(objective_mode: str = OBJECTIVE_MODE, objective_alpha: float 
     # Data stores for metrics
     history_allocations = np.zeros((TOTAL_SLOTS, NUM_CLIENTS))
     history_goodputs = np.zeros((TOTAL_SLOTS, NUM_CLIENTS))
+    history_aoi_s = np.full((TOTAL_SLOTS, NUM_CLIENTS), np.nan)
 
     print(
         "Starting simulation: "
@@ -119,8 +120,8 @@ def run_simulation(objective_mode: str = OBJECTIVE_MODE, objective_alpha: float 
 
         for i in range(NUM_CLIENTS):
             S_i, l_i, _ = client_step_outputs[i]
-            # Time-aware goodput under parallel-slot approximation.
-            x_i = (1 + l_i) / slot_time_s
+            # Paper-aligned rate proxy: R_i(t) = A_i(t) / T(t), with A_i ~= l_i.
+            x_i = l_i / slot_time_s
 
             # 4. State Update [cite: 131]
             tilda_alpha = l_i / S_i if S_i > 0 else 0.0
@@ -129,6 +130,8 @@ def run_simulation(objective_mode: str = OBJECTIVE_MODE, objective_alpha: float 
 
             history_allocations[t, i] = S_i
             history_goodputs[t, i] = x_i
+            if l_i > 0:
+                history_aoi_s[t, i] = slot_time_s / l_i
             total_goodput_in_slot += x_i
 
         # --- Data Monitoring ---
@@ -142,16 +145,24 @@ def run_simulation(objective_mode: str = OBJECTIVE_MODE, objective_alpha: float 
     print("\n" + "=" * 60)
     print("Simulation Finished: Summary Report")
     print("=" * 60)
-    print(f"{'Client': >8} | {'True α': >8} | {'Avg S': >8} | {'Avg x': >8} | {'Fairness (x/S)': >15}")
+    print(
+        f"{'Client': >8} | {'True α': >8} | {'Avg S': >8} | "
+        f"{'Avg R': >8} | {'Avg AoI(s)': >10} | {'Fairness (R/S)': >15}"
+    )
     print("-" * 60)
 
     avg_allocations = np.mean(history_allocations, axis=0)
     avg_goodputs = np.mean(history_goodputs, axis=0)
+    avg_aoi_s = np.nanmean(history_aoi_s, axis=0)
+    avg_aoi_s = np.where(np.isnan(avg_aoi_s), 0.0, avg_aoi_s)
 
     for i in range(NUM_CLIENTS):
         # Avoid division by zero for fairness metric if a client got no allocation.
         fairness = avg_goodputs[i] / avg_allocations[i] if avg_allocations[i] > 0 else 0
-        print(f"{i: >8} | {'N/A': >8} | {avg_allocations[i]: >8.2f} | {avg_goodputs[i]: >8.2f} | {fairness: >15.2f}")
+        print(
+            f"{i: >8} | {'N/A': >8} | {avg_allocations[i]: >8.2f} | "
+            f"{avg_goodputs[i]: >8.2f} | {avg_aoi_s[i]: >10.3f} | {fairness: >15.2f}"
+        )
     print("-" * 60)
     
     print("\nFinal Generated Texts:")

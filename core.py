@@ -56,3 +56,33 @@ def calculate_weight(X: float) -> float:
     """
     # Prevent division by zero or negative values.
     return 1 / np.maximum(X, 1e-6)
+
+
+def calculate_objective_weight(
+    X: float, objective_mode: str = "paper_log_r", alpha: float = 1.0
+) -> float:
+    """
+    Compute per-client gradient-like weight for scheduler objective.
+
+    Modes:
+        - paper_log_r:
+            U(X) = log(X), dU/dX = 1 / X
+        - r_plus_inv_alpha_aoi:
+            U(X) = X + (1/alpha) * AoI, with AoI ~= 1 / X
+            => U(X) = X + 1/(alpha*X)
+            => dU/dX = 1 - 1/(alpha*X^2)
+    """
+    safe_x = float(np.maximum(X, 1e-6))
+    safe_alpha = float(np.maximum(alpha, 1e-6))
+
+    if objective_mode == "paper_log_r":
+        return 1.0 / safe_x
+
+    if objective_mode == "r_plus_inv_alpha_aoi":
+        grad = 1.0 - 1.0 / (safe_alpha * safe_x * safe_x)
+        # Negative gradient would imply that allocating more budget harms this
+        # objective at current state; clamp for stable greedy allocation.
+        return float(np.maximum(grad, 0.0))
+
+    # Fallback to paper mode for unknown values.
+    return 1.0 / safe_x

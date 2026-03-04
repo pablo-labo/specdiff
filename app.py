@@ -23,6 +23,10 @@ class RunConfig:
     initial_prompts: Optional[list[str]] = None
     target_model_name: str = "Qwen/Qwen2.5-7B-Instruct"
     draft_model_name: str = "Qwen/Qwen2.5-0.5B-Instruct"
+    upload_delay_ms: float = 2.0
+    feedback_delay_ms: float = 2.0
+    objective_mode: str = "paper_log_r"
+    objective_alpha: float = 1.0
 
     # allow construction from a dict (e.g. JSON payload)
     @classmethod
@@ -39,6 +43,10 @@ class RunConfig:
             "initial_prompts",
             "target_model_name",
             "draft_model_name",
+            "upload_delay_ms",
+            "feedback_delay_ms",
+            "objective_mode",
+            "objective_alpha",
         ):
             if field in data:
                 kwargs[field] = data[field]
@@ -86,7 +94,11 @@ class RealRunService:
         else:
             client_prompts = [cfg.initial_prompt for _ in range(cfg.num_clients)]
 
-        scheduler = GradientScheduler(capacity=cfg.cloud_capacity)
+        scheduler = GradientScheduler(
+            capacity=cfg.cloud_capacity,
+            objective_mode=cfg.objective_mode,
+            objective_alpha=cfg.objective_alpha,
+        )
         clients = [ClientState(eta=cfg.eta, beta=cfg.beta) for _ in range(cfg.num_clients)]
 
         history_allocations = np.zeros((cfg.total_slots, cfg.num_clients))
@@ -109,26 +121,28 @@ class RealRunService:
             S_allocations = scheduler.allocate(clients)
             slot_total_goodput = 0
             client_step_outputs = []
-            draft_times = []
-            verify_times = []
-
+            client_results, draft_times, verify_time_s = engine.step_all_clients_timed(S_allocations)
             for i in range(cfg.num_clients):
-                S_i = int(S_allocations[i])
-                l_i, new_tokens, draft_time_s, verify_time_s = engine.step_for_client_timed(
-                    client_idx=i, draft_length_S=S_i
-                )
+                S_i, l_i, new_tokens = client_results[i]
                 engine.update_prompt_for_client(client_idx=i, new_tokens=new_tokens)
                 client_step_outputs.append((S_i, l_i, len(new_tokens)))
-                draft_times.append(draft_time_s)
-                verify_times.append(verify_time_s)
                 total_accepted_tokens += int(l_i)
                 total_emitted_tokens += int(len(new_tokens))
                 emitted_tokens_per_client[i] += int(len(new_tokens))
 
-            # Virtual parallel slot time:
-            # draft is parallel across clients -> max(draft_times),
-            # verification is shared/serial -> sum(verify_times).
-            slot_time_s = (max(draft_times) if draft_times else 0.0) + sum(verify_times)
+            # Time model aligned with SpecDiff Eq. (14)(16)(17)(18):
+            # W(t) = max_i(G_i + U_i), V(t) = verifier time, F(t) = max_i(D_i)
+            upload_delays_s = [cfg.upload_delay_ms / 1000.0 for _ in range(cfg.num_clients)]
+            feedback_delays_s = [cfg.feedback_delay_ms / 1000.0 for _ in range(cfg.num_clients)]
+
+            barrier_wait_s = max(
+                (draft_times[i] + upload_delays_s[i] for i in range(cfg.num_clients)),
+                default=0.0,
+            )
+            # Verification stage uses one shared batch forward in target model.
+            verify_stage_s = verify_time_s
+            feedback_stage_s = max(feedback_delays_s, default=0.0)
+            slot_time_s = barrier_wait_s + verify_stage_s + feedback_stage_s
             slot_time_s = max(slot_time_s, 1e-6)
             speculative_virtual_time_s += slot_time_s
             for i in range(cfg.num_clients):
@@ -207,6 +221,8 @@ class RealRunService:
                 "speculative_toks_per_s": speculative_toks_per_s,
                 "baseline_toks_per_s": baseline_toks_per_s,
                 "speedup_ratio": speedup_ratio,
+                "objective_mode": cfg.objective_mode,
+                "objective_alpha": cfg.objective_alpha,
             },
             "slot_wall_latency_ms": [float(v) for v in slot_wall_latency_ms],
         }
@@ -372,6 +388,13 @@ HTML_TEMPLATE = """
             <label>Capacity: <input id="cloudCapacity" type="number" value="20" min="1" style="width:60px"></label>
             <label>η: <input id="eta" type="number" step="0.01" value="0.1" style="width:50px"></label>
             <label>β: <input id="beta" type="number" step="0.01" value="0.1" style="width:50px"></label>
+            <label>Objective:
+                <select id="objectiveMode" style="width:200px">
+                    <option value="paper_log_r" selected>paper_log_r</option>
+                    <option value="r_plus_inv_alpha_aoi">r_plus_inv_alpha_aoi</option>
+                </select>
+            </label>
+            <label>α(obj): <input id="objectiveAlpha" type="number" step="0.1" value="1.0" min="0.000001" style="width:70px"></label>
             <label>Prompt: <input id="initialPrompt" type="text" value="The future of artificial intelligence depends on" style="width:300px"></label>
             <button id="runBtn">Run Real Experiment</button>
             <a id="saveBtn" href="#" style="display:none; margin-left:12px;">Download Results</a>
@@ -421,6 +444,8 @@ HTML_TEMPLATE = """
         const cloudCapacityInp = document.getElementById('cloudCapacity');
         const etaInp = document.getElementById('eta');
         const betaInp = document.getElementById('beta');
+        const objectiveModeInp = document.getElementById('objectiveMode');
+        const objectiveAlphaInp = document.getElementById('objectiveAlpha');
         const initialPromptInp = document.getElementById('initialPrompt');
 
         let goodputChart;
@@ -494,6 +519,8 @@ HTML_TEMPLATE = """
                 statCard('Speculative tok/s', summary.speculative_toks_per_s.toFixed(2)),
                 statCard('Baseline tok/s', summary.baseline_toks_per_s.toFixed(2)),
                 statCard('Speedup', speed),
+                statCard('Objective', summary.objective_mode || 'paper_log_r'),
+                statCard('Obj α', (summary.objective_alpha ?? 1.0).toString()),
             ].join('');
         }
 
@@ -530,6 +557,8 @@ HTML_TEMPLATE = """
                     cloud_capacity: parseInt(cloudCapacityInp.value, 10),
                     eta: parseFloat(etaInp.value),
                     beta: parseFloat(betaInp.value),
+                    objective_mode: objectiveModeInp.value,
+                    objective_alpha: parseFloat(objectiveAlphaInp.value),
                     initial_prompt: initialPromptInp.value,
                 };
                 const response = await fetch('/api/run', {

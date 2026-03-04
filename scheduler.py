@@ -1,13 +1,18 @@
 import numpy as np
 from typing import List
-from core import ClientState, mu_func, calculate_weight
+from core import ClientState, mu_func, calculate_objective_weight
 
 class GradientScheduler:
     """
     Implements the gradient-based scheduling algorithm to allocate verification budget.
     """
 
-    def __init__(self, capacity: int):
+    def __init__(
+        self,
+        capacity: int,
+        objective_mode: str = "paper_log_r",
+        objective_alpha: float = 1.0,
+    ):
         """
         Initializes the scheduler with a total verification capacity.
 
@@ -15,6 +20,8 @@ class GradientScheduler:
             capacity: The total verification budget C. [cite: 9]
         """
         self.capacity = capacity
+        self.objective_mode = objective_mode
+        self.objective_alpha = objective_alpha
 
     def allocate(self, clients: List[ClientState]) -> List[int]:
         """
@@ -32,7 +39,12 @@ class GradientScheduler:
         num_clients = len(clients)
         allocations = [0] * num_clients
 
-        weights = [calculate_weight(client.X) for client in clients]
+        weights = [
+            calculate_objective_weight(
+                client.X, objective_mode=self.objective_mode, alpha=self.objective_alpha
+            )
+            for client in clients
+        ]
         alphas = [client.hat_alpha for client in clients]
 
         # Greedy allocation loop for C iterations.

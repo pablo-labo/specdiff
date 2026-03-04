@@ -1,4 +1,5 @@
 import numpy as np
+import argparse
 from core import ClientState, update_alpha, update_X
 from scheduler import GradientScheduler
 from engine import RealSpeculativeEngine
@@ -10,6 +11,10 @@ CLOUD_CAPACITY = 20
 NUM_DRAFTS_K = 3
 ETA = 0.1  # Learning rate for alpha smoothing
 BETA = 0.1 # Learning rate for X smoothing
+UPLOAD_DELAY_MS = [2.0, 2.0, 2.0]
+FEEDBACK_DELAY_MS = [2.0, 2.0, 2.0]
+OBJECTIVE_MODE = "paper_log_r"  # or "r_plus_inv_alpha_aoi"
+OBJECTIVE_ALPHA = 1.0
 INITIAL_PROMPTS = [
     "Write a concise summary of why speculative decoding improves inference throughput.",
     "Draft a short explanation of fairness-aware scheduling in multi-client model serving.",
@@ -44,12 +49,16 @@ def simulate_best_of_k_selection(draft_length: int, true_alpha: float, k: int) -
             
     return max_accepted_len
 
-def run_simulation():
+def run_simulation(objective_mode: str = OBJECTIVE_MODE, objective_alpha: float = OBJECTIVE_ALPHA):
     """
     Main simulation entry point.
     """
     # --- Initialization ---
-    scheduler = GradientScheduler(capacity=CLOUD_CAPACITY)
+    scheduler = GradientScheduler(
+        capacity=CLOUD_CAPACITY,
+        objective_mode=objective_mode,
+        objective_alpha=objective_alpha,
+    )
     clients = [ClientState(eta=ETA, beta=BETA) for _ in range(NUM_CLIENTS)]
     
     # --- Initialize Real Engine ---
@@ -67,7 +76,11 @@ def run_simulation():
     history_allocations = np.zeros((TOTAL_SLOTS, NUM_CLIENTS))
     history_goodputs = np.zeros((TOTAL_SLOTS, NUM_CLIENTS))
 
-    print(f"Starting simulation: N={NUM_CLIENTS}, T={TOTAL_SLOTS}, C={CLOUD_CAPACITY}")
+    print(
+        "Starting simulation: "
+        f"N={NUM_CLIENTS}, T={TOTAL_SLOTS}, C={CLOUD_CAPACITY}, "
+        f"objective={objective_mode}, alpha={objective_alpha}"
+    )
     print("-" * 60)
 
     # --- 2. Simulation Loop ---
@@ -76,28 +89,32 @@ def run_simulation():
         S_allocations = scheduler.allocate(clients)
         
         total_goodput_in_slot = 0
+        # 2. Real Inference Step
+        # Draft per client, then verify all drafts in one target-model batch.
+        client_results, draft_times, verify_time_s = engine.step_all_clients_timed(S_allocations)
         client_step_outputs = []
-        draft_times = []
-        verify_times = []
-        
         for i in range(NUM_CLIENTS):
-            S_i = S_allocations[i]
-            
-            # 2. Real Inference Step
-            # Each client evolves its own independent prompt/context.
-            l_i, new_tokens, draft_time_s, verify_time_s = engine.step_for_client_timed(
-                client_idx=i, draft_length_S=S_i
-            )
-            
-            # Update only this client's prompt.
+            S_i, l_i, new_tokens = client_results[i]
             engine.update_prompt_for_client(client_idx=i, new_tokens=new_tokens)
             client_step_outputs.append((S_i, l_i, len(new_tokens)))
-            draft_times.append(draft_time_s)
-            verify_times.append(verify_time_s)
 
-        # Virtual parallel slot time:
-        # parallel draft stage + shared serial verification stage.
-        slot_time_s = (max(draft_times) if draft_times else 0.0) + sum(verify_times)
+        # Time model aligned with SpecDiff Eq. (14)(16)(17)(18):
+        # W(t) = max_i(G_i + U_i), V(t) = verifier time, F(t) = max_i(D_i)
+        upload_delays_s = [ms / 1000.0 for ms in UPLOAD_DELAY_MS[:NUM_CLIENTS]]
+        feedback_delays_s = [ms / 1000.0 for ms in FEEDBACK_DELAY_MS[:NUM_CLIENTS]]
+        while len(upload_delays_s) < NUM_CLIENTS:
+            upload_delays_s.append(0.0)
+        while len(feedback_delays_s) < NUM_CLIENTS:
+            feedback_delays_s.append(0.0)
+
+        barrier_wait_s = max(
+            (draft_times[i] + upload_delays_s[i] for i in range(NUM_CLIENTS)),
+            default=0.0,
+        )
+        # Verification stage uses one shared batch forward in target model.
+        verify_stage_s = verify_time_s
+        feedback_stage_s = max(feedback_delays_s, default=0.0)
+        slot_time_s = barrier_wait_s + verify_stage_s + feedback_stage_s
         slot_time_s = max(slot_time_s, 1e-6)
 
         for i in range(NUM_CLIENTS):
@@ -118,7 +135,7 @@ def run_simulation():
         utilization = np.sum(S_allocations) / CLOUD_CAPACITY
         print(
             f"Slot {t+1: >3}/{TOTAL_SLOTS} | Total Goodput: {total_goodput_in_slot: >8.2f} "
-            f"| SlotTime(max): {slot_time_s*1000: >7.1f} ms | Utilization: {utilization: >4.1%}"
+            f"| SlotTime(W+V+F): {slot_time_s*1000: >7.1f} ms | Utilization: {utilization: >4.1%}"
         )
 
     # --- 3. Final Report ---
@@ -143,4 +160,18 @@ def run_simulation():
 
 
 if __name__ == "__main__":
-    run_simulation()
+    parser = argparse.ArgumentParser(description="Run speculative scheduling simulation.")
+    parser.add_argument(
+        "--objective-mode",
+        default=OBJECTIVE_MODE,
+        choices=["paper_log_r", "r_plus_inv_alpha_aoi"],
+        help="Scheduling objective mode.",
+    )
+    parser.add_argument(
+        "--objective-alpha",
+        type=float,
+        default=OBJECTIVE_ALPHA,
+        help="Alpha coefficient used by r_plus_inv_alpha_aoi mode.",
+    )
+    args = parser.parse_args()
+    run_simulation(objective_mode=args.objective_mode, objective_alpha=args.objective_alpha)

@@ -3,6 +3,7 @@ import json
 import socketserver
 import threading
 import time
+import traceback
 from dataclasses import dataclass
 from typing import Optional
 
@@ -552,6 +553,10 @@ HTML_TEMPLATE = """
         }
 
         function setStats(summary) {
+            if (!summary || typeof summary !== 'object') {
+                statsEl.innerHTML = '';
+                return;
+            }
             const speed = summary.speedup_ratio > 0 ? `${summary.speedup_ratio.toFixed(2)}x` : 'N/A';
             statsEl.innerHTML = [
                 statCard('Total Slots', summary.total_slots),
@@ -627,7 +632,10 @@ HTML_TEMPLATE = """
                     body: JSON.stringify({config}),
                 });
                 const data = await response.json();
-                setStats(data.summary);
+                if (!response.ok) {
+                    throw new Error(data?.error || `HTTP ${response.status}`);
+                }
+                setStats(data?.summary);
                 updateCharts(data);
                 renderFinalTexts(data);
                 statusEl.textContent = 'Done';
@@ -669,6 +677,7 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                 self.end_headers()
                 self.wfile.write(body)
             except Exception as exc:
+                traceback.print_exc()
                 body = json.dumps({"error": str(exc)}).encode("utf-8")
                 self.send_response(500)
                 self.send_header("Content-type", "application/json")
@@ -695,6 +704,7 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                 self.end_headers()
                 self.wfile.write(body)
             except Exception as exc:
+                traceback.print_exc()
                 body = json.dumps({"error": str(exc)}).encode("utf-8")
                 self.send_response(500)
                 self.send_header("Content-type", "application/json")

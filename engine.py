@@ -50,6 +50,13 @@ class RealSpeculativeEngine:
         
         self.current_prompt_ids = None
         self.client_prompt_ids = []
+        # Draft proposals should be sampled from q (no truncation), matching verifier assumptions.
+        self._draft_sampling_kwargs = {
+            "do_sample": True,
+            "temperature": 1.0,
+            "top_p": 1.0,
+            "top_k": 0,
+        }
 
     def set_prompt(self, text):
         self.current_prompt_ids = self.tokenizer.encode(text, return_tensors="pt").to(self.device)
@@ -81,7 +88,7 @@ class RealSpeculativeEngine:
         draft_outputs = self.draft_model.generate(
             self.current_prompt_ids,
             max_new_tokens=draft_length_S,
-            do_sample=False, 
+            **self._draft_sampling_kwargs,
             use_cache=True,
             pad_token_id=self.tokenizer.eos_token_id
         )
@@ -139,7 +146,7 @@ class RealSpeculativeEngine:
         draft_outputs = self.draft_model.generate(
             self.current_prompt_ids,
             max_new_tokens=draft_length_S,
-            do_sample=False,
+            **self._draft_sampling_kwargs,
             use_cache=True,
             pad_token_id=self.tokenizer.eos_token_id
         )
@@ -235,7 +242,7 @@ class RealSpeculativeEngine:
             draft_outputs = self.draft_model.generate(
                 prompt_ids,
                 max_new_tokens=S_i,
-                do_sample=False,
+                **self._draft_sampling_kwargs,
                 use_cache=True,
                 pad_token_id=self.tokenizer.eos_token_id,
             )

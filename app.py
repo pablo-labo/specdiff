@@ -318,9 +318,36 @@ HTML_TEMPLATE = """
         }
         .controls {
             display: flex;
-            align-items: center;
+            flex-wrap: wrap;
+            align-items: flex-end;
             gap: 12px;
             margin-bottom: 14px;
+        }
+        .controls label {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            white-space: nowrap;
+        }
+        .controls input,
+        .controls select {
+            max-width: 100%;
+        }
+        .controls .prompt-field {
+            flex: 1 1 340px;
+            min-width: 260px;
+            white-space: normal;
+        }
+        .controls .prompt-field input {
+            flex: 1 1 auto;
+            min-width: 0;
+            width: 100% !important;
+        }
+        .controls .actions {
+            display: inline-flex;
+            align-items: center;
+            gap: 12px;
+            flex: 0 0 auto;
         }
         button {
             border: 0;
@@ -338,6 +365,9 @@ HTML_TEMPLATE = """
         #status {
             color: var(--muted);
             font-size: 14px;
+            flex: 1 1 100%;
+            white-space: normal;
+            overflow-wrap: anywhere;
         }
         .stats {
             display: grid;
@@ -419,9 +449,11 @@ HTML_TEMPLATE = """
                 </select>
             </label>
             <label>α(obj): <input id="objectiveAlpha" type="number" step="0.1" value="1.0" min="0.000001" style="width:70px"></label>
-            <label>Prompt: <input id="initialPrompt" type="text" value="The future of artificial intelligence depends on" style="width:300px"></label>
-            <button id="runBtn">Run Real Experiment</button>
-            <a id="saveBtn" href="#" style="display:none; margin-left:12px;">Download Results</a>
+            <label class="prompt-field">Prompt: <input id="initialPrompt" type="text" value="The future of artificial intelligence depends on"></label>
+            <div class="actions">
+                <button id="runBtn">Run Real Experiment</button>
+                <a id="saveBtn" href="#" style="display:none;">Download Results</a>
+            </div>
             <span id="status">Idle</span>
         </div>
 

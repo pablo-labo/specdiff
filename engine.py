@@ -17,6 +17,17 @@ def _sample_residual_token(p_probs: torch.Tensor, q_probs: torch.Tensor) -> torc
     residual = residual / residual_mass
     return torch.multinomial(residual, num_samples=1).squeeze(0)
 
+
+def _align_vocab_probs(
+    p_probs: torch.Tensor, q_probs: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor, int]:
+    """
+    Align target/draft probability vectors to a shared support.
+    Some model pairs expose slightly different vocab sizes.
+    """
+    shared_vocab = min(int(p_probs.shape[-1]), int(q_probs.shape[-1]))
+    return p_probs[..., :shared_vocab], q_probs[..., :shared_vocab], shared_vocab
+
 class RealSpeculativeEngine:
     def __init__(self, target_model_name, draft_model_name, device="cuda"):
         print(f"Loading models on {device} with 4-bit quantization...")
@@ -116,9 +127,16 @@ class RealSpeculativeEngine:
             token_id = draft_tokens[i]
             p_probs = p_probs_all[i]
             q_probs = q_probs_all[i]
+            p_probs, q_probs, shared_vocab = _align_vocab_probs(p_probs, q_probs)
+            token_id_int = int(token_id.item())
 
-            p_token = p_probs[token_id]
-            q_token = torch.clamp(q_probs[token_id], min=1e-12)
+            if token_id_int >= shared_vocab:
+                replacement = _sample_residual_token(p_probs, q_probs)
+                accepted_tokens.append(replacement)
+                break
+
+            p_token = p_probs[token_id_int]
+            q_token = torch.clamp(q_probs[token_id_int], min=1e-12)
             accept_prob = torch.clamp(p_token / q_token, max=1.0)
 
             if torch.rand((), device=self.device) < accept_prob:
@@ -173,9 +191,16 @@ class RealSpeculativeEngine:
             token_id = draft_tokens[i]
             p_probs = p_probs_all[i]
             q_probs = q_probs_all[i]
+            p_probs, q_probs, shared_vocab = _align_vocab_probs(p_probs, q_probs)
+            token_id_int = int(token_id.item())
 
-            p_token = p_probs[token_id]
-            q_token = torch.clamp(q_probs[token_id], min=1e-12)
+            if token_id_int >= shared_vocab:
+                replacement = _sample_residual_token(p_probs, q_probs)
+                accepted_tokens.append(replacement)
+                break
+
+            p_token = p_probs[token_id_int]
+            q_token = torch.clamp(q_probs[token_id_int], min=1e-12)
             accept_prob = torch.clamp(p_token / q_token, max=1.0)
 
             if torch.rand((), device=self.device) < accept_prob:
@@ -299,9 +324,16 @@ class RealSpeculativeEngine:
                     token_id = draft_tokens[pos]
                     p_probs = p_probs_all[pos]
                     q_probs = q_probs_all[pos]
+                    p_probs, q_probs, shared_vocab = _align_vocab_probs(p_probs, q_probs)
+                    token_id_int = int(token_id.item())
 
-                    p_token = p_probs[token_id]
-                    q_token = torch.clamp(q_probs[token_id], min=1e-12)
+                    if token_id_int >= shared_vocab:
+                        replacement = _sample_residual_token(p_probs, q_probs)
+                        accepted_tokens.append(replacement)
+                        break
+
+                    p_token = p_probs[token_id_int]
+                    q_token = torch.clamp(q_probs[token_id_int], min=1e-12)
                     accept_prob = torch.clamp(p_token / q_token, max=1.0)
 
                     if torch.rand((), device=self.device) < accept_prob:

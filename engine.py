@@ -1,6 +1,8 @@
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 import time
+import os
+from pathlib import Path
 from torch.nn.utils.rnn import pad_sequence
 
 
@@ -31,6 +33,15 @@ def _align_vocab_probs(
 class RealSpeculativeEngine:
     def __init__(self, target_model_name, draft_model_name, device="cuda"):
         print(f"Loading models on {device} with 4-bit quantization...")
+
+        # Keep model artifacts inside project workspace by default.
+        project_root = Path(__file__).resolve().parent
+        default_cache_dir = project_root / ".model_cache" / "huggingface"
+        cache_dir = Path(
+            os.environ.get("SPECDIFF_MODEL_CACHE_DIR", str(default_cache_dir))
+        ).expanduser()
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        print(f"Using HuggingFace cache dir: {cache_dir}")
         
         # 4-bit Quantization Config to save VRAM
         bnb_config = BitsAndBytesConfig(
@@ -41,20 +52,25 @@ class RealSpeculativeEngine:
         )
 
         # 1. Load Tokenizer (Assuming they share the same tokenizer, which Qwen2.5 does)
-        self.tokenizer = AutoTokenizer.from_pretrained(target_model_name)
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            target_model_name,
+            cache_dir=str(cache_dir),
+        )
         self.device = device
 
         # 2. Load Target Model (Verification Server) - 7B
         self.target_model = AutoModelForCausalLM.from_pretrained(
-            target_model_name, 
+            target_model_name,
+            cache_dir=str(cache_dir),
             quantization_config=bnb_config,
-            device_map="auto" 
+            device_map="auto"
         )
         
         # 3. Load Draft Model (Edge Drafter) - 0.5B
         # We load it once, but can use it multiple times to simulate multiple clients
         self.draft_model = AutoModelForCausalLM.from_pretrained(
-            draft_model_name, 
+            draft_model_name,
+            cache_dir=str(cache_dir),
             quantization_config=bnb_config,
             device_map="auto"
         )
